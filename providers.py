@@ -1,6 +1,8 @@
-"""Bốn provider cùng một interface. Không chứa agent loop."""
+"""Bốn provider cùng một interface. Hỗ trợ fallback tự động."""
 import json
 import os
+from pathlib import Path
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +14,43 @@ CONFIG = {
 }
 
 
+def _load_env_if_present():
+    env_file = Path(__file__).resolve().parent / '.env'
+    if env_file.exists():
+        for line in env_file.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, v = line.split('=', 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k not in os.environ:
+                    os.environ[k] = v
+
+
+_load_env_if_present()
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    req_data = json.dumps(payload).encode()
+    all_headers = {'Content-Type': 'application/json', 'User-Agent': 'StatusAgentLab/1.0', **headers}
+    for attempt in range(4):
+        req = urllib.request.Request(url, data=req_data, headers=all_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            if exc.code in (500, 502, 503, 504) and attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {str(exc)}') from exc
 
 
 class Provider:
@@ -36,10 +65,13 @@ class Provider:
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
-        key_name, self.url = CONFIG[name]
+        key_name, default_url = CONFIG[name]
+        self.url = (os.getenv('OPENAI_BASE_URL') if (name == 'openai' and os.getenv('OPENAI_BASE_URL')) else default_url)
         self.key = os.getenv(key_name)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
+        self.fallback_url = os.getenv('FALLBACK_BASE_URL', 'http://localhost:11434/v1/chat/completions')
+        self.fallback_model = os.getenv('FALLBACK_MODEL', 'qwen2.5:7b')
 
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
@@ -47,7 +79,15 @@ class Provider:
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        try:
+            data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        except RuntimeError as exc:
+            # Tự động fallback sang local Ollama nếu gặp lỗi limit/quota
+            if self.fallback_url and any(err in str(exc).lower() for err in ('429', 'quota', 'không kết nối')):
+                fb_payload = dict(payload, model=self.fallback_model)
+                data = post_json(self.fallback_url, {'Authorization': 'Bearer ollama'}, fb_payload)
+            else:
+                raise
         choice = data['choices'][0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
